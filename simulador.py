@@ -5,7 +5,7 @@ import pandas as pd
 from pathlib import Path
 import base64
 
-st.set_page_config(page_title="HORTITRANS Invernadero", layout="wide")
+st.set_page_config(page_title="simulador invernadero", layout="wide")
 
 # --- Constantes y Coeficientes del Modelo ---
 LAMBDA_J_KG = 2.45e6
@@ -149,8 +149,8 @@ def solve_equilibrium_temperature(params, max_iter=60, tol=0.05, alpha=0.4):
     }
 
 # --- Interfaz de Usuario ---
-st.title("💧 Simulador de humedad y transpiración en Invernaderos")
-st.info("Este simulador tiene un uso exclusivamente **didáctico**.")
+st.title("💧 Simulador EN PRUEBAS")
+st.info("Esta es una página de pruebas. **NO ES EXPLOTABLE Y PUEDE TENER ERRORES**.")
 
 with st.expander("ℹ️ ¿Qué se va calcular?"):
     st.markdown("""
