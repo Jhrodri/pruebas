@@ -5,7 +5,7 @@ import pandas as pd
 from pathlib import Path
 import base64
 
-st.set_page_config(page_title="simulador invernadero", layout="wide")
+st.set_page_config(page_title="HORTITRANS Invernadero", layout="wide")
 
 # --- Constantes y Coeficientes del Modelo ---
 LAMBDA_J_KG = 2.45e6
@@ -13,6 +13,7 @@ GAMMA = 66
 RHO_AIR = 1.2
 CPA = 1012
 C1, C2, C3, C4, C5, C6 = 0.154, 1.10, 1.13, 1.65, 0.56, 13.0
+SIGMA = 5.67e-8          # W·m⁻²·K⁻⁴  (Stefan-Boltzmann)
 
 # --- Funciones de Cálculo del Modelo ---
 def calculate_saturation_vapor_pressure(T_celsius):
@@ -27,9 +28,11 @@ def hortitrans_model(params):
     A_cubierta = A_suelo * 1.5
     e_si = calculate_saturation_vapor_pressure(T_i)
     e_o = calculate_saturation_vapor_pressure(T_o) * (RH_o / 100.0)
-    R_i = R_sol_ext * 0.7
+    _tau = 0.5 if (params.get('lw', {}).get('cielo') == 'Cielo nublado' and R_sol_ext > 0) else 0.7
+    R_i = R_sol_ext * _tau
 
-    h_t = C4 * LAI * (1 - C5 * np.exp(-R_i / C6))
+    _f_luz = 1.0 if R_i >= 10.0 else 0.0
+    h_t = C4 * LAI * (1 - C5 * np.exp(-R_i / C6)) * _f_luz
     f_w = 0.22
     f_T = 0.16
 
@@ -43,7 +46,9 @@ def hortitrans_model(params):
         A_ventilacion_efectiva = Cd * A_vent_total * (angulo_vent / 100.0)
 
     A_total_flujo = A_infiltracion + A_ventilacion_efectiva
-    q = A_total_flujo * np.sqrt(f_w**2 * w**2 + f_T**2 * abs(T_i - T_o))
+    q_natural = A_total_flujo * np.sqrt(f_w**2 * w**2 + f_T**2 * abs(T_i - T_o))
+    q_min     = A_ventilacion_efectiva * 0.05   # mínimo difusión turbulenta con ventanas abiertas (m³/s)
+    q         = max(q_natural, q_min)
     h_v = (RHO_AIR * CPA * q) / A_suelo if A_suelo > 0 else 0
     hc = 5.25
     U_value = 6.0
@@ -72,9 +77,14 @@ def hortitrans_model(params):
     E_c_kgs = max(0, (hc * (e_i - esx) - hci * (e_si - e_i))) / (LAMBDA_J_KG * GAMMA)
     E_v_kgs = max(0, h_v * (e_i - e_o)) / (LAMBDA_J_KG * GAMMA)
 
+    H_INV   = 4.0                                          # altura media invernadero (m)
+    V_inv   = A_suelo * H_INV                              # volumen interior (m³)
+    ACH     = q * 3600.0 / V_inv if V_inv > 0 else 0.0    # renovaciones·h⁻¹
+
     return {
         'RH_i': RH_i, 'VPD_i_kPa': VPD_i_kPa,
         'E_t_kgs': E_t_kgs, 'E_c_kgs': E_c_kgs, 'E_v_kgs': E_v_kgs,
+        'q_m3s': q, 'ACH': ACH,
     }
 
 def solve_equilibrium_temperature(params, max_iter=60, tol=0.05, alpha=0.4):
@@ -83,9 +93,14 @@ def solve_equilibrium_temperature(params, max_iter=60, tol=0.05, alpha=0.4):
     de equilibrio libre (sin calefacción/refrigeración activa) y la carga
     de climatización necesaria para mantener la temperatura de consigna.
 
-    Balance energético:
-      R_i·A_suelo + Q_hvac = ρ·Cp·q·(T_i−T_o) + U_eff·A_cub·(T_i−T_o) + E_t·λ·A_suelo
-    donde U_eff = hc·U/(hc+U) ≈ 2.8 W·m⁻²·K⁻¹
+    Balance energético (radiación OL linealizada como conductancia adicional de cubierta):
+      Q_solar + Q_hvac = ρ·Cp·q·(T_i−T_o) + U_r·A_cub·(T_i−T_o) + Q_off + E_t·λ·A_suelo
+    donde:
+      h_rad = 4·ε·σ·T_mean³             (conductancia radiativa, ε=0.90 PE térmico)
+      U_r   = hc_i·(h_ext+h_rad)/(hc_i+h_ext+h_rad)   (≈ 3.5 W·m⁻²·K⁻¹)
+      Q_off = hc_i·h_rad/(hc_i+h_ext+h_rad)·A_cub·ΔT_sky  (offset por cielo frío)
+    La radiación y la conducción se suman EN la cubierta (no son independientes en el
+    balance interior), por lo que Q_LW NO se resta por separado sobre U_eff original.
     """
     T_o          = params['weather'][0]
     R_sol_ext    = params['weather'][2]
@@ -96,11 +111,17 @@ def solve_equilibrium_temperature(params, max_iter=60, tol=0.05, alpha=0.4):
     angulo_vent  = params['control'][1]
     E_ad_kgs     = params['control'][2]
     T_consigna   = params['control'][0]
+    delta_T_sky  = params.get('lw', {}).get('delta_T_sky', 10)   # °C
+    Q_suelo      = 35.0 * A_suelo                                  # W (25 W/m² fijo)
 
-    A_cubierta   = A_suelo * 1.5
-    R_i          = R_sol_ext * 0.7
-    Q_solar      = R_i * A_suelo                          # W
-    U_eff        = 5.25 * 6.0 / (5.25 + 6.0)             # ≈ 2.8 W·m⁻²·K⁻¹
+    EPS_CUB = 0.90   # emisividad PE térmico
+    H_EXT   = 6.0    # conductancia exterior cubierta (= U_value en hortitrans)
+    HC_INT  = 5.25   # convección interior
+
+    A_cubierta = A_suelo * 1.5
+    _tau       = 0.5 if (delta_T_sky == 10 and R_sol_ext > 0) else 0.7
+    R_i        = R_sol_ext * _tau
+    Q_solar    = R_i * A_suelo                    # W
 
     def _q_flow(T_i):
         if estanqueidad == 'Totalmente Estanco':
@@ -108,7 +129,20 @@ def solve_equilibrium_temperature(params, max_iter=60, tol=0.05, alpha=0.4):
         f_c  = {'Muy Estanco': 2.5e-4, 'Normal': 10e-4, 'Con Fugas': 20e-4}[estanqueidad]
         A_if = A_cubierta * f_c
         A_vf = 0.65 * A_vent_tot * (angulo_vent / 100.0)
-        return (A_if + A_vf) * np.sqrt(0.22**2 * w**2 + 0.16**2 * abs(T_i - T_o))
+        q_nat = (A_if + A_vf) * np.sqrt(0.22**2 * w**2 + 0.16**2 * abs(T_i - T_o))
+        q_min = A_vf * 0.05    # mínimo difusión turbulenta con ventanas abiertas
+        return max(q_nat, q_min)
+
+    def _cov_terms(T_i):
+        """U_eff con radiación OL linealizada y offset por depresión del cielo (W)."""
+        T_cub  = T_i - (T_i - T_o) * H_EXT / (HC_INT + H_EXT)  # T cubierta aprox.
+        T_sky  = T_o - delta_T_sky
+        T_m_K  = (T_cub + T_sky) / 2.0 + 273.15                 # temperatura media K
+        h_rad  = 4.0 * EPS_CUB * SIGMA * T_m_K**3               # W·m⁻²·K⁻¹  (~4–5)
+        denom  = HC_INT + H_EXT + h_rad
+        U_r    = HC_INT * (H_EXT + h_rad) / denom                # ≈ 3.5 W·m⁻²·K⁻¹
+        Q_off  = HC_INT * h_rad / denom * A_cubierta * delta_T_sky  # W  (>0 = pérdida)
+        return U_r, Q_off
 
     T_i = float(T_consigna)
     converged = False
@@ -119,10 +153,11 @@ def solve_equilibrium_temperature(params, max_iter=60, tol=0.05, alpha=0.4):
         r_eq = hortitrans_model(p_it)
         if not r_eq:
             break
-        Q_lat  = r_eq['E_t_kgs'] * LAMBDA_J_KG * A_suelo
-        K_loss = RHO_AIR * CPA * _q_flow(T_i) + U_eff * A_cubierta
-        T_new  = float(np.clip(
-            T_o + (Q_solar - Q_lat) / K_loss if K_loss > 1e-3 else T_o + 40.0,
+        Q_lat      = r_eq['E_t_kgs'] * LAMBDA_J_KG * A_suelo
+        U_r, Q_off = _cov_terms(T_i)
+        K_loss     = RHO_AIR * CPA * _q_flow(T_i) + U_r * A_cubierta
+        T_new      = float(np.clip(
+            T_o + (Q_solar + Q_suelo - Q_lat - Q_off) / K_loss if K_loss > 1e-3 else T_o + 40.0,
             -15.0, 80.0))
         T_next = alpha * T_new + (1 - alpha) * T_i
         if abs(T_next - T_i) < tol:
@@ -132,10 +167,11 @@ def solve_equilibrium_temperature(params, max_iter=60, tol=0.05, alpha=0.4):
         T_i = T_next
 
     # Carga HVAC a T_consigna
-    r_c     = hortitrans_model({**params, 'control': (T_consigna, angulo_vent, E_ad_kgs)})
-    K_c     = RHO_AIR * CPA * _q_flow(T_consigna) + U_eff * A_cubierta
-    Q_lat_c = r_c.get('E_t_kgs', 0) * LAMBDA_J_KG * A_suelo if r_c else 0.0
-    Q_hvac  = K_c * (T_consigna - T_o) + Q_lat_c - Q_solar   # W; >0 calefacción
+    r_c            = hortitrans_model({**params, 'control': (T_consigna, angulo_vent, E_ad_kgs)})
+    U_r_c, Q_off_c = _cov_terms(T_consigna)
+    K_c            = RHO_AIR * CPA * _q_flow(T_consigna) + U_r_c * A_cubierta
+    Q_lat_c        = r_c.get('E_t_kgs', 0) * LAMBDA_J_KG * A_suelo if r_c else 0.0
+    Q_hvac         = K_c * (T_consigna - T_o) + Q_lat_c + Q_off_c - Q_solar  # W; >0 calefacción
 
     return {
         'T_eq':        round(T_i, 1),
@@ -149,8 +185,8 @@ def solve_equilibrium_temperature(params, max_iter=60, tol=0.05, alpha=0.4):
     }
 
 # --- Interfaz de Usuario ---
-st.title("💧 Simulador EN PRUEBAS")
-st.info("Esta es una página de pruebas. **NO ES EXPLOTABLE Y PUEDE TENER ERRORES**.")
+st.title("💧 Simulador de humedad y transpiración en Invernaderos")
+st.info("Este simulador tiene un uso exclusivamente **didáctico**.")
 
 with st.expander("ℹ️ ¿Qué se va calcular?"):
     st.markdown("""
@@ -166,6 +202,7 @@ _defaults = {
     'ss_area_suelo': 8000, 'ss_area_ventanas': 1600, 'ss_estanqueidad': 'Normal',
     'ss_LAI': 3.0, 'ss_T_o': 25.0, 'ss_RH_o': 80, 'ss_R_sol': 400, 'ss_viento': 2.0,
     'ss_T_i': 30.0, 'ss_apertura': 50, 'ss_humidif': 0.0,
+    'ss_cielo': 'Cielo nublado',
 }
 for k, v in _defaults.items():
     if k not in st.session_state:
@@ -238,6 +275,14 @@ with st.sidebar:
         p_RH_o = st.slider("Humedad relativa exterior (%)", 10, 100, step=1, key="ss_RH_o")
         p_R_sol_ext = st.slider("Radiación solar exterior (W/m²)", 0, 1000, step=10, key="ss_R_sol")
         p_w = st.slider("Velocidad del viento (m/s)", 0.0, 15.0, step=0.5, key="ss_viento")
+        _CIELO_OPTS = ['Cielo nublado', 'Cielo despejado']
+        p_cielo = st.selectbox(
+            "Estado del cielo", _CIELO_OPTS,
+            index=_CIELO_OPTS.index(st.session_state['ss_cielo']),
+            key="ss_cielo",
+            help="Cielo nublado: ΔT_cielo = 10 °C · Cielo despejado: ΔT_cielo = 20 °C"
+        )
+        p_delta_T_sky = 10 if p_cielo == 'Cielo nublado' else 20
 
     with st.expander("4. Consignas de Control Interno", expanded=True):
         p_T_i = st.slider("Temperatura interior (°C)", 0.0, 45.0, step=0.5, key="ss_T_i")
@@ -255,7 +300,8 @@ params_dict = {
     'gh': (p_A_suelo, p_A_vent_total, p_tipo_cubierta, p_estanqueidad, 'Enrollable (lineal)'),
     'crop': {'LAI': p_LAI},
     'weather': (p_T_o, p_RH_o, p_R_sol_ext, p_w),
-    'control': (p_T_i, p_angulo_vent, p_E_ad_kgs)
+    'control': (p_T_i, p_angulo_vent, p_E_ad_kgs),
+    'lw': {'delta_T_sky': p_delta_T_sky, 'cielo': p_cielo},
 }
 results = hortitrans_model(params_dict)
 if results:
@@ -325,11 +371,14 @@ with tab_sim:
         st.metric(label="Transpiración Cultivo (g m⁻² h⁻¹)", value=f"{E_t_gmh:.2f}")
         st.markdown("---")
 
-        col_flujo1, col_flujo2 = st.columns(2)
+        col_flujo1, col_flujo2, col_flujo3 = st.columns(3)
         with col_flujo1:
             st.metric(label="Ventilación (g m⁻² h⁻¹)", value=f"{E_v_gmh:.2f}", help="Vapor de agua que sale por la ventilación.")
         with col_flujo2:
             st.metric(label="Condensación (g m⁻² h⁻¹)", value=f"{E_c_gmh:.2f}", help="Vapor de agua que se condensa en la cubierta.")
+        with col_flujo3:
+            st.metric(label="Renovaciones (h⁻¹)", value=f"{results.get('ACH', 0):.1f}",
+                      help="Tasa de renovación del aire interior. Calculada para una altura media de invernadero de 4 m.")
 
         st.markdown("---")
         st.subheader("Recomendaciones de Control")
@@ -353,30 +402,40 @@ with tab_sim:
         st.session_state['_eq_results'] = eq
         dT   = eq['T_eq'] - eq['T_consigna']
 
-        with st.expander("🌡️ Temperatura de equilibrio libre", expanded=False):
+        with st.expander("🌡️ Condiciones de equilibrio pasivo", expanded=False):
             st.markdown(
                 "Condiciones interiores si el invernadero operara **sin calefacción ni refrigeración activa**, "
                 "únicamente con la ventilación y la radiación solar configuradas."
             )
-            r_eq = eq.get('results_eq', {})
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                st.metric("T equilibrio libre",
-                          f"{eq['T_eq']:.1f} °C",
-                          delta=f"{dT:+.1f} °C vs consigna",
-                          delta_color="off")
-            with c2:
-                st.metric("HR", f"{r_eq.get('RH_i', 0):.1f} %")
-            with c3:
-                st.metric("DPV", f"{r_eq.get('VPD_i_kPa', 0):.2f} kPa")
-            with c4:
-                st.metric("Transpiración",
-                          f"{r_eq.get('E_t_kgs', 0)*1000*3600:.2f} g·m⁻²·h⁻¹")
+            if eq['T_eq'] - p_T_o > 20:
+                st.warning("Comprueba los datos introducidos o el grado de apertura de las ventanas. Los valores no son coherentes para los invernaderos mediterráneos y/o provocarían la muerte del cultivo.")
+            else:
+                r_eq = eq.get('results_eq', {})
+                c1, c2, c3, c4, c5 = st.columns(5)
+                with c1:
+                    st.metric("T equilibrio pasivo",
+                              f"{eq['T_eq']:.1f} °C",
+                              delta=f"{dT:+.1f} °C vs consigna",
+                              delta_color="off")
+                with c2:
+                    st.metric("HR", f"{r_eq.get('RH_i', 0):.1f} %")
+                with c3:
+                    st.metric("DPV", f"{r_eq.get('VPD_i_kPa', 0):.2f} kPa")
+                with c4:
+                    st.metric("Transpiración",
+                              f"{r_eq.get('E_t_kgs', 0)*1000*3600:.2f} g·m⁻²·h⁻¹")
+                with c5:
+                    st.metric("Renovaciones",
+                              f"{r_eq.get('ACH', 0):.1f} h⁻¹",
+                              help="Tasa de renovación del aire a T de equilibrio (altura 4 m).")
 
-            conv_txt = (f"✓ Convergido en {eq['iters']} iteraciones"
-                        if eq['converged']
-                        else f"⚠️ No convergió en {eq['iters']} iteraciones")
-            st.caption(conv_txt)
+                if r_eq.get('E_c_kgs', 0) > 0:
+                    st.warning("⚠️ Riesgo de condensación en cubierta en condiciones de equilibrio pasivo.")
+
+                conv_txt = (f"✓ {eq['iters']} iteraciones"
+                            if eq['converged']
+                            else f"⚠️ No convergió ({eq['iters']} iteraciones)")
+                st.caption(conv_txt)
 
 # --- Generador de informe HTML ---
 def _df_to_html(df):
@@ -475,7 +534,7 @@ def generate_html_report():
 <div class="results">
 <table class="data-table">
 <tr><th>Variable</th><th>Valor</th></tr>
-<tr><td>T equilibrio libre</td><td>{_T_eq}</td></tr>
+<tr><td>T equilibrio pasivo</td><td>{_T_eq}</td></tr>
 <tr><td>T consigna</td><td>{_T_c}</td></tr>
 <tr><td>HR en equilibrio</td><td>{_RH_eq}</td></tr>
 <tr><td>DPV en equilibrio</td><td>{_DPV_eq}</td></tr>
