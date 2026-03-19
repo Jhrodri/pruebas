@@ -3,3 +3,4 @@ pandas
 numpy
 matplotlib
 plotly
+fpdf2>=2.7.9
