@@ -190,8 +190,8 @@ def solve_equilibrium_temperature(params, max_iter=60, tol=0.05, alpha=0.4):
     }
 
 # --- Interfaz de Usuario ---
-st.title("💧 Simulador de humedad y transpiración en Invernaderos")
-st.info("Este simulador tiene un uso exclusivamente **didáctico**.")
+st.title("💧 Simulador de humedad y transpiración en Invernaderos...**EN PRUEBAS**")
+st.info("Este simulador no está en explotación y puede tener errores.")
 
 with st.expander("ℹ️ ¿Qué se va calcular?"):
     st.markdown("""
